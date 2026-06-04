@@ -137,6 +137,20 @@ export default function WebContainerIde() {
         // Ignore if it doesn't exist
       }
 
+      // Modify next.config.ts/js if it exists to remove turbopack config, as Turbopack uses Rust native binaries unsupported by WebContainers
+      const fixNextConfig = async (fileName: string) => {
+         try {
+             const configContent = await wcInstance.fs.readFile(fileName, 'utf-8');
+             if (configContent.includes('turbopack')) {
+                 const newConfig = configContent.replace(/turbopack:\s*\{[^}]*\}/g, '/* removed turbopack for webcontainer */');
+                 await wcInstance.fs.writeFile(fileName, newConfig);
+             }
+         } catch(e) {}
+      };
+      await fixNextConfig('next.config.ts');
+      await fixNextConfig('next.config.js');
+      await fixNextConfig('next.config.mjs');
+
       setStatus('Installing dependencies (npm install)...');
       const installProcess = await wcInstance.spawn('npm', ['install', '--no-audit', '--no-fund', '--legacy-peer-deps']);
       
@@ -153,7 +167,8 @@ export default function WebContainerIde() {
       }
 
       setStatus('Starting development server (npm run dev)...');
-      const devProcess = await wcInstance.spawn('npm', ['run', 'dev']);
+      // Force next dev to use webpack instead of turbopack
+      const devProcess = await wcInstance.spawn('npm', ['run', 'dev', '--', '--webpack']);
       devProcess.output.pipeTo(new WritableStream({
         write(data) {
           console.log('[npm run dev]', data);
