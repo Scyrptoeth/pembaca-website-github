@@ -22,8 +22,11 @@ export default function WebContainerIde() {
 
         // Listen for server-ready event to set the iframe URL
         webcontainerInstance.on('server-ready', (port, url) => {
-          setIframeUrl(url);
-          setStatus(`Server running on ${url}`);
+          setStatus(`Server running on ${url}. Booting Next.js...`);
+          // Adding a small delay to let Next.js actually start serving HTML before iframe loads it
+          setTimeout(() => {
+            setIframeUrl(url);
+          }, 3000);
         });
 
       } catch (error: any) {
@@ -127,23 +130,35 @@ export default function WebContainerIde() {
       setStatus('Mounting files to WebContainer...');
       await wcInstance.mount(rootFolder);
 
+      // Remove package-lock.json if it exists to prevent cross-platform installation issues in WebContainers
+      try {
+        await wcInstance.fs.rm('package-lock.json');
+      } catch(e) {
+        // Ignore if it doesn't exist
+      }
+
       setStatus('Installing dependencies (npm install)...');
-      const installProcess = await wcInstance.spawn('npm', ['install']);
+      const installProcess = await wcInstance.spawn('npm', ['install', '--no-audit', '--no-fund', '--legacy-peer-deps']);
       
       installProcess.output.pipeTo(new WritableStream({
         write(data) {
-          console.log(data);
+          console.log('[npm install]', data);
         }
       }));
 
       const installExitCode = await installProcess.exit;
 
       if (installExitCode !== 0) {
-        throw new Error('Installation failed');
+        throw new Error('Installation failed (Check console for details)');
       }
 
       setStatus('Starting development server (npm run dev)...');
-      await wcInstance.spawn('npm', ['run', 'dev']);
+      const devProcess = await wcInstance.spawn('npm', ['run', 'dev']);
+      devProcess.output.pipeTo(new WritableStream({
+        write(data) {
+          console.log('[npm run dev]', data);
+        }
+      }));
 
     } catch (error: any) {
        setStatus(`Error: ${error.message}`);
