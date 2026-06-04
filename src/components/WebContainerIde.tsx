@@ -1,6 +1,6 @@
 "use client";
 
-import { WebContainer, type FileSystemTree } from "@webcontainer/api";
+import { WebContainer, type FileSystemTree, type WebContainerProcess } from "@webcontainer/api";
 import JSZip from "jszip";
 import {
   ArrowUpRight,
@@ -18,6 +18,7 @@ import {
   UploadCloud,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { isTransformableSource, transformUploadedTextFile } from "@/lib/preview-transform";
 
 type StatusKind = "booting" | "ready" | "working" | "running" | "error";
 
@@ -28,12 +29,19 @@ type InspectorHit = {
   evidence: string[];
 };
 
-const defaultRepo = "https://github.com/Scyrptoeth/Website-Penilaian-Bisnis";
+type LocalPreviewResult = {
+  url: string;
+  rootFolderName: string;
+  framework: string;
+  command: string;
+  workspace: string;
+};
 
+const defaultRepo = "https://github.com/Scyrptoeth/Website-Penilaian-Bisnis";
 const pipeline = [
-  "Load ZIP repository into WebContainer",
+  "Load ZIP repository into an isolated preview workspace",
   "Inject data-github-source into JSX surfaces",
-  "Run npm install and Next.js dev server",
+  "Run dependency install and detected dev server",
   "Alt-click preview elements to capture source path",
 ];
 
@@ -41,6 +49,7 @@ export default function WebContainerIde() {
   const [status, setStatus] = useState("Booting WebContainer...");
   const [statusKind, setStatusKind] = useState<StatusKind>("booting");
   const [iframeUrl, setIframeUrl] = useState<string | null>(null);
+  const [iframeReloadKey, setIframeReloadKey] = useState(0);
   const [wcInstance, setWcInstance] = useState<WebContainer | null>(null);
   const [rootFolderName, setRootFolderName] = useState("");
   const [githubUser, setGithubUser] = useState("Scyrptoeth");
@@ -48,6 +57,11 @@ export default function WebContainerIde() {
   const [branch, setBranch] = useState("main");
   const [selectedSource, setSelectedSource] = useState<InspectorHit | null>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const devProcessRef = useRef<WebContainerProcess | null>(null);
+  const previewRequestRef = useRef(0);
+  const previewReloadTimerRef = useRef<number | null>(null);
+  const lastUploadRef = useRef<{ signature: string; at: number } | null>(null);
 
   useEffect(() => {
     let disposed = false;
@@ -62,11 +76,36 @@ export default function WebContainerIde() {
         setStatusKind("ready");
 
         webcontainerInstance.on("server-ready", (_port, url) => {
-          setStatus(`Server running at ${url}. Waiting for preview HTML...`);
-          setStatusKind("running");
-          window.setTimeout(() => {
+          const previewRequestId = previewRequestRef.current + 1;
+          previewRequestRef.current = previewRequestId;
+          let attempt = 0;
+
+          if (previewReloadTimerRef.current) {
+            window.clearTimeout(previewReloadTimerRef.current);
+            previewReloadTimerRef.current = null;
+          }
+
+          const loadPreview = () => {
+            if (previewRequestRef.current !== previewRequestId) return;
+            attempt += 1;
+
+            if (attempt > 35) {
+              setStatus("Preview failed: target app did not report a healthy preview in time.");
+              setStatusKind("error");
+              return;
+            }
+
+            setStatus(`Server running at ${url}. Validating preview load ${attempt}/35...`);
+            setStatusKind("running");
             setIframeUrl(url);
-          }, 3000);
+            setIframeReloadKey((currentKey) => currentKey + 1);
+
+            previewReloadTimerRef.current = window.setTimeout(loadPreview, attempt < 10 ? 2500 : 5000);
+          };
+
+          setStatus(`Server running at ${url}. Waiting for preview ready signal...`);
+          setStatusKind("running");
+          loadPreview();
         });
       } catch (error) {
         setStatus(`WebContainer boot failed: ${messageFromError(error)}`);
@@ -78,11 +117,25 @@ export default function WebContainerIde() {
 
     return () => {
       disposed = true;
+      if (previewReloadTimerRef.current) {
+        window.clearTimeout(previewReloadTimerRef.current);
+        previewReloadTimerRef.current = null;
+      }
     };
   }, []);
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
+      if (event.data?.type === "GITHUB_INSPECTOR_READY") {
+        if (previewReloadTimerRef.current) {
+          window.clearTimeout(previewReloadTimerRef.current);
+          previewReloadTimerRef.current = null;
+        }
+        setStatus(`Preview ready at ${String(event.data.href || "target app")}.`);
+        setStatusKind("running");
+        return;
+      }
+
       if (event.data?.type !== "GITHUB_INSPECTOR_CLICK") return;
 
       const sourcePath = String(event.data.source || "");
@@ -105,16 +158,70 @@ export default function WebContainerIde() {
     return rootFolderName.replace("-main", "").replace(/\/$/, "");
   }, [rootFolderName]);
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file || !wcInstance) return;
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement> | React.FormEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    if (!file) return;
+    await handleRepositoryFile(file);
+  };
+
+  const handleUploadButtonClick = async () => {
+    const file = uploadInputRef.current?.files?.[0];
+    if (!file) {
+      setStatus("Choose a repository ZIP before starting preview.");
+      setStatusKind("error");
+      return;
+    }
+
+    await handleRepositoryFile(file);
+  };
+
+  const handleRepositoryFile = async (file: File) => {
+    if (!file) return;
+
+    const uploadSignature = `${file.name}:${file.size}:${file.lastModified}`;
+    const now = Date.now();
+    if (lastUploadRef.current?.signature === uploadSignature && now - lastUploadRef.current.at < 2000) {
+      return;
+    }
+    lastUploadRef.current = { signature: uploadSignature, at: now };
 
     setIframeUrl(null);
     setSelectedSource(null);
+    previewRequestRef.current += 1;
+    if (previewReloadTimerRef.current) {
+      window.clearTimeout(previewReloadTimerRef.current);
+      previewReloadTimerRef.current = null;
+    }
     setStatus("Extracting ZIP file...");
     setStatusKind("working");
 
     try {
+      const localPreview = await startLocalPreview(file);
+      setRootFolderName(localPreview.rootFolderName);
+      if (localPreview.rootFolderName && repoUrl === defaultRepo) {
+        setRepoUrl(`https://github.com/${githubUser}/${localPreview.rootFolderName.replace("-main", "")}`);
+      }
+      setStatus(
+        `Local ${localPreview.framework} preview ready at ${localPreview.url}. Command: ${localPreview.command}`,
+      );
+      setStatusKind("running");
+      setIframeUrl(localPreview.url);
+      setIframeReloadKey((currentKey) => currentKey + 1);
+      return;
+    } catch (localError) {
+      if (!wcInstance) {
+        setStatus(`Local preview failed: ${messageFromError(localError)}`);
+        setStatusKind("error");
+        return;
+      }
+
+      setStatus(`Local preview failed, falling back to WebContainer: ${messageFromError(localError)}`);
+    }
+
+    try {
+      devProcessRef.current?.kill();
+      devProcessRef.current = null;
+
       const zip = await JSZip.loadAsync(file);
       const filesObject: FileSystemTree = {};
       let detectedRootFolder = "";
@@ -123,15 +230,19 @@ export default function WebContainerIde() {
         const zipEntry = zip.files[relativePath];
         if (zipEntry.dir) continue;
 
-        const content = await zipEntry.async("string");
-        const finalContent = instrumentSource(relativePath, content);
+        const shouldTransform = isTransformableSource(relativePath);
+        const shouldPatchPackage = relativePath.endsWith("package.json");
+        const content =
+          shouldTransform || shouldPatchPackage
+            ? transformUploadedTextFile(relativePath, await zipEntry.async("string"), { normalizeNext: true })
+            : await zipEntry.async("uint8array");
         const pathParts = relativePath.split("/");
 
         if (!detectedRootFolder && pathParts.length > 1) {
           detectedRootFolder = pathParts[0];
         }
 
-        assignFile(filesObject, pathParts, finalContent);
+        assignFile(filesObject, pathParts, content);
       }
 
       const rootKeys = Object.keys(filesObject);
@@ -149,7 +260,11 @@ export default function WebContainerIde() {
       setStatus("Mounting files to WebContainer...");
       await wcInstance.mount(rootFolder);
       await removeIfExists(wcInstance, "package-lock.json");
-      await stripUnsupportedTurbopackConfig(wcInstance);
+      const nextProject = await isNextProject(wcInstance);
+      if (nextProject) {
+        await stripUnsupportedTurbopackConfig(wcInstance);
+      }
+      const previewEnv = await buildPreviewEnvironment(wcInstance);
 
       setStatus("Installing dependencies with npm...");
       const installProcess = await wcInstance.spawn("npm", [
@@ -172,8 +287,30 @@ export default function WebContainerIde() {
         throw new Error("Installation failed. Check browser console for WebContainer logs.");
       }
 
-      setStatus("Starting Next.js dev server with webpack...");
-      const devProcess = await wcInstance.spawn("npm", ["run", "dev", "--", "--webpack"]);
+      if (nextProject) {
+        setStatus("Building Next.js production preview...");
+        const buildProcess = await wcInstance.spawn("npm", ["run", "build", "--", "--webpack"], {
+          env: previewEnv,
+        });
+        buildProcess.output.pipeTo(
+          new WritableStream({
+            write(data) {
+              console.log("[webcontainer:npm run build]", data);
+            },
+          }),
+        );
+
+        const buildExitCode = await buildProcess.exit;
+        if (buildExitCode !== 0) {
+          throw new Error("Next.js preview build failed. Check browser console for WebContainer logs.");
+        }
+      }
+
+      setStatus(nextProject ? "Starting Next.js production preview server..." : "Starting repository dev server...");
+      const devProcess = await wcInstance.spawn("npm", nextProject ? ["run", "start"] : ["run", "dev"], {
+        env: previewEnv,
+      });
+      devProcessRef.current = devProcess;
       devProcess.output.pipeTo(
         new WritableStream({
           write(data) {
@@ -181,6 +318,14 @@ export default function WebContainerIde() {
           },
         }),
       );
+      devProcess.exit.then((exitCode) => {
+        if (devProcessRef.current !== devProcess) return;
+        devProcessRef.current = null;
+        if (exitCode !== 0) {
+          setStatus(`Dev server exited with code ${exitCode}. Check browser console logs.`);
+          setStatusKind("error");
+        }
+      });
     } catch (error) {
       setStatus(`Error: ${messageFromError(error)}`);
       setStatusKind("error");
@@ -223,11 +368,20 @@ export default function WebContainerIde() {
                 <input
                   accept=".zip"
                   className="w-full text-sm"
-                  disabled={!wcInstance}
                   onChange={handleFileUpload}
+                  onInput={handleFileUpload}
+                  ref={uploadInputRef}
                   type="file"
                 />
               </span>
+              <button
+                className="inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-[var(--ink)] px-4 text-sm font-bold text-white"
+                onClick={handleUploadButtonClick}
+                type="button"
+              >
+                <UploadCloud size={16} aria-hidden="true" />
+                Start preview
+              </button>
             </label>
           </section>
         </div>
@@ -280,9 +434,11 @@ export default function WebContainerIde() {
               <iframe
                 allow="cross-origin-isolated"
                 className="h-full w-full border-0"
+                {...({ credentialless: "true" } as Record<string, string>)}
+                key={iframeReloadKey}
                 ref={iframeRef}
                 src={iframeUrl}
-                title="WebContainer Preview"
+                title="Website Preview"
               />
             ) : (
               <EmptyPreview rootFolderName={inferredRepoName} />
@@ -324,7 +480,7 @@ export default function WebContainerIde() {
               </li>
               <li className="flex gap-2">
                 <CheckCircle2 className="mt-0.5 shrink-0 text-[var(--teal)]" size={16} />
-                WebContainer preview for Next.js/React projects.
+                Local Node preview for Next.js/React projects with WebContainer fallback.
               </li>
               <li className="flex gap-2">
                 <CheckCircle2 className="mt-0.5 shrink-0 text-[var(--teal)]" size={16} />
@@ -448,44 +604,34 @@ function SourceResult({ hit }: { hit: InspectorHit }) {
   );
 }
 
-function instrumentSource(relativePath: string, content: string) {
-  if (!relativePath.endsWith(".tsx") && !relativePath.endsWith(".jsx")) return content;
+async function startLocalPreview(file: File): Promise<LocalPreviewResult> {
+  const formData = new FormData();
+  formData.set("repositoryZip", file);
 
-  const firstSlashIndex = relativePath.indexOf("/");
-  const githubPath = firstSlashIndex !== -1 ? relativePath.substring(firstSlashIndex + 1) : relativePath;
-  let finalContent = content.replace(
-    /<(div|main|section|p|span|button|a)(\s+[^>]*)?>/g,
-    (match, tag, rest = "") => {
-      if (rest.includes("data-github-source")) return match;
-      return `<${tag} data-github-source="${githubPath}"${rest}>`;
-    },
-  );
+  const response = await fetch("/api/preview/local", {
+    method: "POST",
+    body: formData,
+  });
+  const payload = (await response.json()) as Partial<LocalPreviewResult> & { error?: string };
 
-  if (relativePath.includes("layout.tsx") || relativePath.includes("_document.tsx")) {
-    finalContent = finalContent.replace("</body>", `${inspectorScript()}\n</body>`);
+  if (!response.ok) {
+    throw new Error(payload.error || "Local preview API failed.");
   }
 
-  return finalContent;
+  if (!payload.url || !payload.framework || !payload.command) {
+    throw new Error("Local preview API returned an incomplete response.");
+  }
+
+  return {
+    url: payload.url,
+    rootFolderName: payload.rootFolderName || "",
+    framework: payload.framework,
+    command: payload.command,
+    workspace: payload.workspace || "",
+  };
 }
 
-function inspectorScript() {
-  return `<script dangerouslySetInnerHTML={{__html: "\\n" +
-    "if (typeof window !== 'undefined' && !window.__INSPECTOR_INIT) {\\n" +
-    "  window.__INSPECTOR_INIT = true;\\n" +
-    "  window.addEventListener('click', (event) => {\\n" +
-    "    if (!event.altKey) return;\\n" +
-    "    const target = event.target;\\n" +
-    "    const sourceNode = target.closest('[data-github-source]');\\n" +
-    "    if (!sourceNode) return;\\n" +
-    "    event.preventDefault();\\n" +
-    "    event.stopPropagation();\\n" +
-    "    window.parent.postMessage({ type: 'GITHUB_INSPECTOR_CLICK', source: sourceNode.getAttribute('data-github-source') }, '*');\\n" +
-    "  }, { capture: true });\\n" +
-    "}\\n"
-  }} />`;
-}
-
-function assignFile(tree: FileSystemTree, pathParts: string[], content: string) {
+function assignFile(tree: FileSystemTree, pathParts: string[], content: string | Uint8Array) {
   let currentLevel = tree;
 
   for (let i = 0; i < pathParts.length; i += 1) {
@@ -512,6 +658,43 @@ async function removeIfExists(webcontainer: WebContainer, path: string) {
   }
 }
 
+async function isNextProject(webcontainer: WebContainer) {
+  try {
+    const packageJson = JSON.parse(await webcontainer.fs.readFile("package.json", "utf-8")) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    return Boolean(packageJson.dependencies?.next || packageJson.devDependencies?.next);
+  } catch {
+    return false;
+  }
+}
+
+async function buildPreviewEnvironment(webcontainer: WebContainer) {
+  const env: Record<string, string> = {
+    NEXT_TELEMETRY_DISABLED: "1",
+  };
+  const envExampleFiles = [".env.example", ".env.local.example", ".env.development.example"];
+
+  for (const fileName of envExampleFiles) {
+    try {
+      const envExample = await webcontainer.fs.readFile(fileName, "utf-8");
+      for (const line of envExample.split("\n")) {
+        const match = line.match(/^\s*([A-Z0-9_]+)\s*=/);
+        const key = match?.[1];
+        if (key && key.includes("AUTH_BYPASS")) {
+          env[key] = "1";
+        }
+      }
+    } catch {
+      // Env example files are optional in uploaded projects.
+    }
+  }
+
+  return env;
+}
+
 async function stripUnsupportedTurbopackConfig(webcontainer: WebContainer) {
   const configFiles = ["next.config.ts", "next.config.js", "next.config.mjs"];
 
@@ -522,7 +705,7 @@ async function stripUnsupportedTurbopackConfig(webcontainer: WebContainer) {
 
       const newConfig = configContent.replace(
         /turbopack:\s*\{[^}]*\},?/g,
-        "/* removed turbopack for webcontainer */",
+        "/* removed turbopack for WebContainer Webpack preview */",
       );
       await webcontainer.fs.writeFile(fileName, newConfig);
     } catch {
