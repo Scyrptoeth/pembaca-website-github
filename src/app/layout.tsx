@@ -14,8 +14,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Pembaca Website & Github",
-  description: "DOM-to-Source Mapper Showcase",
+  title: "Pembaca Website & GitHub",
+  description:
+    "Workbench untuk menjalankan repository ZIP, menginspeksi website, dan membuka source file GitHub.",
 };
 
 export default function RootLayout({
@@ -24,7 +25,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="id">
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >

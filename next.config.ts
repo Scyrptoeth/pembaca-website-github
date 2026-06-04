@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  outputFileTracingRoot: __dirname,
   // Required headers for WebContainers (SharedArrayBuffer)
   async headers() {
     return [
