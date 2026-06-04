@@ -8,6 +8,8 @@ export default function WebContainerIde() {
   const [status, setStatus] = useState<string>('Booting WebContainer...');
   const [iframeUrl, setIframeUrl] = useState<string | null>(null);
   const [wcInstance, setWcInstance] = useState<WebContainer | null>(null);
+  const [rootFolderName, setRootFolderName] = useState<string>('');
+  const [githubUser, setGithubUser] = useState<string>('Scyrptoeth');
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   // Initialize WebContainer on mount
@@ -31,6 +33,23 @@ export default function WebContainerIde() {
     boot();
   }, []);
 
+  // Listen for the postMessage from the iframe
+  useEffect(() => {
+    const handleMessage = (e: MessageEvent) => {
+      if (e.data?.type === 'GITHUB_INSPECTOR_CLICK') {
+        const sourcePath = e.data.source;
+        if (rootFolderName) {
+           // E.g., Website-Penilaian-Bisnis-main -> Website-Penilaian-Bisnis
+           const repoName = rootFolderName.replace('-main', '').replace(/\/$/, '');
+           const finalUrl = `https://github.com/${githubUser}/${repoName}/blob/main/${sourcePath}`;
+           window.open(finalUrl, '_blank');
+        }
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [rootFolderName, githubUser]);
+
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file || !wcInstance) return;
@@ -39,6 +58,7 @@ export default function WebContainerIde() {
     try {
       const zip = await JSZip.loadAsync(file);
       const filesObject: Record<string, any> = {};
+      let detectedRootFolder = '';
 
       // Convert JSZip object to WebContainer file system structure
       for (const relativePath in zip.files) {
@@ -46,29 +66,50 @@ export default function WebContainerIde() {
         if (!zipEntry.dir) {
           const content = await zipEntry.async('string');
           
-          // --- INJECTION LOGIC ---
-          // In a real app, you would inject the data-github-source attributes here
-          // before writing the file to the WebContainer
           let finalContent = content;
           if (relativePath.endsWith('.tsx') || relativePath.endsWith('.jsx')) {
-              // Basic rudimentary injection for POC
-              finalContent = content.replace(/<(div|main|section|p|span|button)/g, `<$1 data-github-source="${relativePath}" `);
-          }
-          // -----------------------
+              // Extract the relative path without the root folder prefix
+              const firstSlashIndex = relativePath.indexOf('/');
+              const githubPath = firstSlashIndex !== -1 ? relativePath.substring(firstSlashIndex + 1) : relativePath;
 
-          // Split path into array to build nested object structure
+              // Rudimentary injection
+              finalContent = content.replace(/<(div|main|section|p|span|button|a)/g, `<$1 data-github-source="${githubPath}" `);
+              
+              if (relativePath.includes('layout.tsx') || relativePath.includes('_document.tsx')) {
+                 const scriptToInject = `
+                 <script dangerouslySetInnerHTML={{__html: "\\n" +
+                     "if (typeof window !== 'undefined' && !window.__INSPECTOR_INIT) {\\n" +
+                     "    window.__INSPECTOR_INIT = true;\\n" +
+                     "    window.addEventListener('click', (e) => {\\n" +
+                     "        if (e.altKey) {\\n" +
+                     "            const target = e.target;\\n" +
+                     "            const sourceNode = target.closest('[data-github-source]');\\n" +
+                     "            if (sourceNode) {\\n" +
+                     "                e.preventDefault();\\n" +
+                     "                e.stopPropagation();\\n" +
+                     "                const source = sourceNode.getAttribute('data-github-source');\\n" +
+                     "                window.parent.postMessage({ type: 'GITHUB_INSPECTOR_CLICK', source }, '*');\\n" +
+                     "            }\\n" +
+                     "        }\\n" +
+                     "    }, { capture: true });\\n" +
+                     "}\\n"
+                 }} />
+                 </body>`;
+                 finalContent = finalContent.replace('</body>', scriptToInject);
+              }
+          }
+
           const pathParts = relativePath.split('/');
+          if (!detectedRootFolder && pathParts.length > 1) {
+              detectedRootFolder = pathParts[0];
+          }
+
           let currentLevel = filesObject;
-          
           for (let i = 0; i < pathParts.length; i++) {
              const part = pathParts[i];
              if (i === pathParts.length - 1) {
-                 // It's a file
-                 currentLevel[part] = {
-                     file: { contents: finalContent }
-                 };
+                 currentLevel[part] = { file: { contents: finalContent } };
              } else {
-                 // It's a directory
                  if (!currentLevel[part]) {
                      currentLevel[part] = { directory: {} };
                  }
@@ -78,15 +119,12 @@ export default function WebContainerIde() {
         }
       }
 
-      setStatus('Mounting files to WebContainer...');
-      // Note: WebContainers expect the root of the file system. 
-      // If the ZIP contains a root folder (e.g. repo-main/), we should mount its contents.
-      // For simplicity in this POC, we mount everything.
-      
-      // Determine the root folder if github zips
       const rootKeys = Object.keys(filesObject);
       const rootFolder = rootKeys.length === 1 && filesObject[rootKeys[0]].directory ? filesObject[rootKeys[0]].directory : filesObject;
+      const finalRootName = rootKeys.length === 1 ? rootKeys[0] : detectedRootFolder;
+      setRootFolderName(finalRootName);
 
+      setStatus('Mounting files to WebContainer...');
       await wcInstance.mount(rootFolder);
 
       setStatus('Installing dependencies (npm install)...');
@@ -94,7 +132,7 @@ export default function WebContainerIde() {
       
       installProcess.output.pipeTo(new WritableStream({
         write(data) {
-          console.log(data); // In real app, pipe to a visible terminal UI
+          console.log(data);
         }
       }));
 
@@ -106,8 +144,6 @@ export default function WebContainerIde() {
 
       setStatus('Starting development server (npm run dev)...');
       await wcInstance.spawn('npm', ['run', 'dev']);
-      
-      // The server-ready event listener will update the iframe URL
 
     } catch (error: any) {
        setStatus(`Error: ${error.message}`);
@@ -121,7 +157,14 @@ export default function WebContainerIde() {
                 <h1 className="text-xl font-bold text-blue-400">Pembaca Website & Github (SaaS)</h1>
                 <p className="text-sm text-slate-400">Status: {status}</p>
             </div>
-            <div>
+            <div className="flex gap-4 items-center">
+                <input 
+                    type="text" 
+                    value={githubUser}
+                    onChange={(e) => setGithubUser(e.target.value)}
+                    placeholder="GitHub Username"
+                    className="px-3 py-2 bg-slate-800 border border-slate-700 rounded text-sm text-white"
+                />
                 <input 
                     type="file" 
                     accept=".zip" 
@@ -147,8 +190,11 @@ export default function WebContainerIde() {
                     allow="cross-origin-isolated"
                 />
             ) : (
-                <div className="flex items-center justify-center w-full h-full text-slate-500">
-                    Upload a Next.js/React .zip project to see the Live Preview here.
+                <div className="flex items-center justify-center w-full h-full text-slate-500 bg-slate-100 flex-col gap-4">
+                    <p>Upload a Next.js/React .zip project to see the Live Preview here.</p>
+                    <p className="text-xs text-slate-400 max-w-md text-center">
+                       Hold <strong>Alt</strong> and click on elements inside the preview to open the corresponding file in GitHub.
+                    </p>
                 </div>
             )}
         </div>
